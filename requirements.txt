@@ -1,0 +1,10 @@
+pymongo
+requests
+openai
+python-dotenv
+websockets 
+openai 
+polygon-api-client
+uvicorn
+fastapi
+httpx
