@@ -23,23 +23,15 @@ load_dotenv()
 app = FastAPI()
 
 # Fetch credentials from environment variables
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_API_KEY = os.getenv("")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
-MONGO_DB_HOST = os.getenv("MONGO_DB_HOST")
-MONGO_DB_PORT = int(os.getenv("MONGO_DB_PORT", 27017))
-MONGO_DB_USER = os.getenv("MONGO_DB_USER")
-MONGO_DB_PASSWORD = os.getenv("MONGO_DB_PASSWORD")
-
 # Set OpenAI API key
 openai.api_key = OPENAI_API_KEY
 
 # MongoDB Connection
-mongo_client = pymongo.MongoClient(
-    host=MONGO_DB_HOST,
-    port=MONGO_DB_PORT,
-    username=MONGO_DB_USER,
-    password=MONGO_DB_PASSWORD
-)
+MONGO_DB_URI = os.getenv("MONGO_DB_URI")
+mongo_client = pymongo.MongoClient(MONGO_DB_URI)
+
 
 # Connect to the ima-user database
 db = mongo_client["ima-user"]
@@ -323,7 +315,7 @@ Your recommendations should be detailed, actionable, and presented in a manner t
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000,
             temperature=0.0
@@ -395,7 +387,11 @@ Your recommendations should be detailed, actionable, and presented in a manner t
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=500, detail=f"Error parsing GPT response: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating suggestions: {e}")
+     print("❌ Full Error Details:", e)
+    import traceback
+    traceback.print_exc()
+    raise HTTPException(status_code=500, detail=f"Error generating suggestions: {str(e)}")
+
 
 
 # API Endpoint to fetch portfolio suggestions
@@ -558,7 +554,7 @@ def analyze_sentiments(user_preferences):
     Return the result in JSON format, with sentiment for each question.
     """  
     response = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.1",
         messages=[
             {"role": "system", "content": "You are an expert in analyzing user sentiments for investment preferences."},
             {"role": "user", "content": prompt}
@@ -790,7 +786,7 @@ def fetch_final_recommendations(sentiments_analysis, tickers_data,user_id):
     Please suggest three refined recommendations in JSON format with detailed reasoning.
     """ 
     response = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.1",
         messages=[
             {"role": "system", "content": "You are an expert financial advisor."},
             {"role": "user", "content": llm_prompt}
@@ -807,30 +803,56 @@ def fetch_final_recommendations(sentiments_analysis, tickers_data,user_id):
         return refined_recommendations
 
 
-def recommend_stocks_via_llm(sentiments_analysis, final_recommendations,user_id):
+def recommend_stocks_via_llm(sentiments_analysis, final_recommendations, user_id):
     """Generate final stock recommendations."""
 
-    existing_stocks = get_portfolio_stocks(user_id)
-    # print(f"Existing stocks for user {user_id}: {existing_stocks}")
+    # ✅ 1) Get existing portfolio tickers (fallback to empty list)
+    existing_stocks = get_portfolio_stocks(user_id) or []
 
-    # Filter final recommendations to exclude existing stocks
-    final_recommendations = [
-        recommendation for recommendation in final_recommendations
-        if recommendation["ticker"].strip().upper() not in existing_stocks
-    ]
+    # ✅ 2) Normalize `final_recommendations` into a list
+    if isinstance(final_recommendations, dict) and "recommendations" in final_recommendations:
+        base_recs = final_recommendations["recommendations"]
+    else:
+        base_recs = final_recommendations
+
+    # ✅ 3) Filter out stocks user already owns (AAPL / GOOGL / TSLA etc.)
+    filtered_recs = []
+    for recommendation in base_recs:
+        # Be safe with keys: ticker | stock_ticker
+        ticker = (recommendation.get("ticker") or recommendation.get("stock_ticker") or "").strip().upper()
+        if ticker and ticker not in existing_stocks:
+            filtered_recs.append(recommendation)
+
+    # (Optional) limit to first few to keep prompt size reasonable
+    final_recommendations = filtered_recs[:10]
+
+    # ✅ 4) Build recommendations_prompt safely
     recommendations_prompt = ""
-
-    # Build recommendations text dynamically
     for rec in final_recommendations:
+        ticker = rec.get("ticker") or rec.get("stock_ticker") or "UNKNOWN"
+        sector = rec.get("sector", "Unknown")
+        name = rec.get("name") or rec.get("company") or rec.get("stock_name") or "Unknown"
+
+        risk_analysis = rec.get("risk_analysis", {}) or {}
+        trend_analysis = rec.get("trend_analysis", {}) or {}
+        historical_analysis = rec.get("historical_analysis", {}) or {}
+
+        trend = risk_analysis.get("trend") or trend_analysis.get("trend_description") or "Unknown"
+        trend_description = trend_analysis.get("trend_description", "")
+        best_month = trend_analysis.get("best_month", "")
+        worst_month = trend_analysis.get("worst_month", "")
+        current_price = historical_analysis.get("current_price") or rec.get("current_price")
+        volatility = risk_analysis.get("volatility")
+
         recommendations_prompt += f"""
-        1. Stock Ticker: {rec['ticker']} ({rec['sector']}, {rec['risk_analysis']['trend']})
-           - Stock Name: {rec['name']}
+        1. Stock Ticker: {ticker} ({sector}, {trend})
+           - Stock Name: {name}
            - Recommendation Rationale: Aligning with user sentiment, market trends, and risk management
            - Potential Growth, Stability, or Income Potential: Based on historical performance
-           -Trend Analysis: {rec['trend_analysis']['trend_description'],rec['trend_analysis']['best_month'],rec['trend_analysis']['worst_month']}
-           - Historical Analysis: {rec['historical_analysis'],rec['current_price']}
-           - Risk Analysis: Volatility: {rec['risk_analysis']['volatility']}, Trend: Indicate whether the stock is "going up," "going down," or "neutral" based on recent historical movements.
-           - Why this stock is best for user: Given your intrestes in Key reasons why the stock is suitable for the your preferences in a conversational tone rather than a robotic tone making the suggestions look trustworthy by building trust, and an approachable tone .
+           - Trend Analysis: {trend_description}, Best month: {best_month}, Worst month: {worst_month}
+           - Historical Analysis: {historical_analysis}, Current price: {current_price}
+           - Risk Analysis: Volatility: {volatility}, Trend: Indicate whether the stock is "going up," "going down," or "neutral" based on recent historical movements.
+           - Why this stock is best for user: Given your interests in key reasons why the stock is suitable for your preferences in a conversational tone rather than a robotic tone, making the suggestions look trustworthy by building trust and an approachable tone.
            - Predicted price : What will be the predicted price of ticker based on opening and closing price of stock
         """
 
@@ -939,7 +961,7 @@ def recommend_stocks_via_llm(sentiments_analysis, final_recommendations,user_id)
     
     """
     response = openai.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-5.1",
         messages=[
             {"role": "system", "content": "You are an expert financial advisor of recommending 3 stocks. Use a friendly, conversational tone rather than AI robotic tone. Think of it like you're talking to a person who trades and you are an stock market expert."},
             {"role": "user", "content": prompt}
@@ -947,7 +969,7 @@ def recommend_stocks_via_llm(sentiments_analysis, final_recommendations,user_id)
         temperature=0.0,
         response_format={"type": "json_object"}
     )
- 
+
     output = response.choices[0].message.content.strip()
     print("GPT Response: ", output)
     return json.loads(output)
@@ -1418,7 +1440,7 @@ def get_openai_response(user_query):
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",
             temperature=0.2,
             messages=messages,
             functions=functions,
@@ -1612,7 +1634,7 @@ def get_gpt_response(previous_response):
 
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.1",
             temperature=0.0,
             messages=messages,
             # max_tokens=150
